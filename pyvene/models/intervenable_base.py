@@ -778,12 +778,13 @@ class IntervenableNdifModel(BaseModel):
             elif hook_type == CONST_OUTPUT_HOOK:
                 output = module_hook.output
 
-            # TODO: this could be faulty by assuming the types.
-            if isinstance(output.dtype, tuple) and isinstance(output.dtype[0], tuple):
+            # Handle tuple outputs (e.g., GPT-2 blocks return (hidden_states, ...))
+            # In nnsight v5, .output returns the actual value directly
+            if isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], tuple):
                 output = output[0][0]
-            elif isinstance(output.dtype, tuple):
+            elif isinstance(output, tuple):
                 output = output[0]
-            
+
             if isinstance(intervention, SkipIntervention):
                 raise NotImplementedError("Skip intervention is not implemented for ndif backend")
             else:
@@ -830,10 +831,11 @@ class IntervenableNdifModel(BaseModel):
             elif hook_type == CONST_OUTPUT_HOOK:
                 output = module_hook.output
 
-            # TODO: this could be faulty by assuming the types.
-            if isinstance(output.dtype, tuple) and isinstance(output.dtype[0], tuple):
+            # Handle tuple outputs (e.g., GPT-2 blocks return (hidden_states, ...))
+            # In nnsight v5, .output returns the actual value directly
+            if isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], tuple):
                 output = output[0][0]
-            elif isinstance(output.dtype, tuple):
+            elif isinstance(output, tuple):
                 output = output[0]
 
             selected_output = self._gather_intervention_output(
@@ -974,6 +976,7 @@ class IntervenableNdifModel(BaseModel):
                             ]
                             if subspaces is not None
                             else None,
+                            None,  # intervention_additional_kwargs
                         )
             counterfactual_outputs = self.model.output.save()
         
