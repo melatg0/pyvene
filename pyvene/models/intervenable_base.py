@@ -926,61 +926,129 @@ class IntervenableNdifModel(BaseModel):
         unit_locations_sources = unit_locations["sources->base"][0]
         unit_locations_base = unit_locations["sources->base"][1]
 
-        # for each source, we hook in getters to cache activations
-        # at each aligning representations
-        if activations_sources is None:
-            assert len(sources) == len(self._intervention_group)
-            for group_id, keys in self._intervention_group.items():
-                if sources[group_id] is None:
-                    continue  # smart jump for advance usage only
-
-                # meta tracer to get activations for all components
-                with self.model.trace(sources[group_id]) as tracer:
-                    for key in keys:
-                        self._intervention_getter(
-                            [key],
-                            [
-                                unit_locations_sources[
-                                    self.sorted_keys.index(key)
-                                ]
-                            ],
-                        )
-                # upon exist, all activations should be saved
+        if self.remote:
+            # Remote execution: use pure nnsight operations only
+            # Pre-extract all needed info to avoid serializing pyvene objects
+            return self._sync_forward_remote(
+                base, sources, unit_locations_sources, unit_locations_base,
+                activations_sources, subspaces, **kwargs
+            )
         else:
-            # simply patch in the ones passed in
-            self.activations = activations_sources
-            for _, passed_in_key in enumerate(self.activations):
-                assert passed_in_key in self.sorted_keys
-        
-        # in parallel mode with ndif backend, we don't need to wait 
-        # for the intervention hook, we synchronously do the interventions.
-        with self.model.trace(base, **kwargs) as tracer:
-            for group_id, keys in self._intervention_group.items():
-                for key in keys:
-                    # skip in case smart jump
-                    if key in self.activations or \
-                        isinstance(self.interventions[key], LambdaIntervention) or \
-                        self.interventions[key].is_source_constant:
-                        self._intervention_setter(
-                            [key],
-                            [
-                                unit_locations_base[
-                                    self.sorted_keys.index(key)
-                                ]
-                            ],
-                            # assume same group targeting the same subspace
-                            [
-                                subspaces[
-                                    self.sorted_keys.index(key)
-                                ]
-                            ]
-                            if subspaces is not None
-                            else None,
-                            None,  # intervention_additional_kwargs
-                        )
-            counterfactual_outputs = self.model.output.save()
-        
+            # Local execution: use existing approach with self references
+            return self._sync_forward_local(
+                base, sources, unit_locations_sources, unit_locations_base,
+                activations_sources, subspaces, **kwargs
+            )
+
+    def _sync_forward_local(
+        self,
+        base,
+        sources,
+        unit_locations_sources,
+        unit_locations_base,
+        activations_sources: Optional[Dict] = None,
+        subspaces: Optional[List] = None,
+        **kwargs,
+    ):
+        """Local execution path - can reference self freely"""
+        with self.model.session(remote=False):
+            # for each source, we hook in getters to cache activations
+            if activations_sources is None:
+                assert len(sources) == len(self._intervention_group)
+                for group_id, keys in self._intervention_group.items():
+                    if sources[group_id] is None:
+                        continue
+
+                    with self.model.trace(sources[group_id]) as tracer:
+                        for key in keys:
+                            self._intervention_getter(
+                                [key],
+                                [unit_locations_sources[self.sorted_keys.index(key)]],
+                            )
+            else:
+                self.activations = activations_sources
+                for _, passed_in_key in enumerate(self.activations):
+                    assert passed_in_key in self.sorted_keys
+
+            with self.model.trace(base, **kwargs) as tracer:
+                for group_id, keys in self._intervention_group.items():
+                    for key in keys:
+                        if key in self.activations or \
+                            isinstance(self.interventions[key], LambdaIntervention) or \
+                            self.interventions[key].is_source_constant:
+                            self._intervention_setter(
+                                [key],
+                                [unit_locations_base[self.sorted_keys.index(key)]],
+                                [subspaces[self.sorted_keys.index(key)]]
+                                if subspaces is not None else None,
+                                None,
+                            )
+                counterfactual_outputs = self.model.output.save()
+
         return counterfactual_outputs
+
+    def _sync_forward_remote(
+        self,
+        base,
+        sources,
+        unit_locations_sources,
+        unit_locations_base,
+        activations_sources: Optional[Dict] = None,
+        subspaces: Optional[List] = None,
+        **kwargs,
+    ):
+        """Remote execution path using NDIF.
+
+        NOTE: Remote execution requires pyvene to be whitelisted on NDIF servers.
+        Until then, use nnsight directly for remote interventions, or contact
+        NDIF team to request pyvene whitelisting.
+        """
+        # Import the helper function from separate module
+        from .ndif_remote_helper import execute_remote_intervention
+
+        # Pre-extract all info needed for remote execution
+        intervention_specs = []
+        for group_id, keys in self._intervention_group.items():
+            for key in keys:
+                intervention = self.interventions[key]
+                (module_hook, hook_type) = self.intervention_hooks[key]
+                key_idx = self.sorted_keys.index(key)
+
+                spec = {
+                    'key': key,
+                    'module_hook': module_hook,
+                    'hook_type': hook_type,
+                    'is_collect': isinstance(intervention, CollectIntervention),
+                    'is_vanilla': isinstance(intervention, VanillaIntervention),
+                    'is_source_constant': intervention.is_source_constant,
+                    'source_loc': unit_locations_sources[key_idx] if unit_locations_sources else None,
+                    'base_loc': unit_locations_base[key_idx] if unit_locations_base else None,
+                    'group_id': group_id,
+                }
+                intervention_specs.append(spec)
+
+        # Call standalone function
+        result = execute_remote_intervention(
+            model=self.model,
+            base=base,
+            sources=sources,
+            intervention_specs=intervention_specs,
+            intervention_group=dict(self._intervention_group),
+            activations_sources=activations_sources,
+            **kwargs
+        )
+
+        # Store collected activations back to self
+        # For CollectIntervention, wrap in list to match expected format
+        if result.get('activations'):
+            for key, activation in result['activations'].items():
+                # Convert nnsight save proxy to tensor and wrap in list
+                if hasattr(activation, 'value'):
+                    self.activations[key] = [activation.value]
+                else:
+                    self.activations[key] = [activation]
+
+        return result['output']
 
     def _sync_forward_with_serial_intervention(
         self,
@@ -1015,7 +1083,7 @@ class IntervenableNdifModel(BaseModel):
         if sources is None and activations_sources is None \
             and unit_locations is None and len(self.interventions) == 0:
             # ndif backend call
-            with self.model.trace(base) as tracer:
+            with self.model.trace(base, remote=self.remote) as tracer:
                 base_outputs = self.model.output.save()
             return base_outputs, None
         # broadcast
@@ -1036,7 +1104,7 @@ class IntervenableNdifModel(BaseModel):
         base_outputs = None
         if output_original_output:
             # returning un-intervened output with gradients with ndif backend call
-            with self.model.trace(base) as tracer:
+            with self.model.trace(base, remote=self.remote) as tracer:
                 base_outputs = self.model.output.save()
 
         # intervene the model based on ndif APIs
@@ -1075,7 +1143,14 @@ class IntervenableNdifModel(BaseModel):
                         self.interventions[key],
                         CollectIntervention
                     ):
-                        collected_activations += self.activations[key].clone()
+                        activation = self.activations[key]
+                        # Handle both list (remote) and tensor (local) cases
+                        if isinstance(activation, list):
+                            collected_activations += activation
+                        elif hasattr(activation, 'clone'):
+                            collected_activations += activation.clone()
+                        else:
+                            collected_activations.append(activation)
 
         except Exception as e:
             raise e
@@ -1116,7 +1191,165 @@ class IntervenableNdifModel(BaseModel):
         output_original_output: Optional[bool] = False,
         **kwargs,
     ):
-        raise NotImplementedError("Please Implement this method")
+        """
+        Generate text with interventions applied during generation.
+
+        For NDIF backend, this uses nnsight's model.generate() context.
+        """
+        if self.remote:
+            return self._generate_remote(
+                base, sources, unit_locations, source_representations,
+                intervene_on_prompt, subspaces, output_original_output, **kwargs
+            )
+        else:
+            return self._generate_local(
+                base, sources, unit_locations, source_representations,
+                intervene_on_prompt, subspaces, output_original_output, **kwargs
+            )
+
+    def _generate_local(
+        self,
+        base,
+        sources: Optional[List] = None,
+        unit_locations: Optional[Dict] = None,
+        source_representations: Optional[Dict] = None,
+        intervene_on_prompt: bool = False,
+        subspaces: Optional[List] = None,
+        output_original_output: Optional[bool] = False,
+        **kwargs,
+    ):
+        """Local generate using nnsight's generate context."""
+        # Build intervention specs (same as forward)
+        activations_sources = source_representations
+        if unit_locations is None:
+            unit_locations = {}
+
+        # Normalize unit_locations
+        if "sources->base" not in unit_locations:
+            if "base" in unit_locations:
+                unit_locations = {"sources->base": (None, unit_locations["base"])}
+            else:
+                unit_locations = {"sources->base": (None, None)}
+
+        unit_locations = self._broadcast_unit_locations(
+            get_batch_size(base), unit_locations
+        )
+
+        # Collect source activations first (if needed)
+        source_activations = {}
+        if activations_sources is None and sources is not None:
+            for key_i, key in enumerate(self.sorted_keys):
+                intervention = self.interventions[key]
+                if isinstance(intervention, VanillaIntervention):
+                    (module_hook, hook_type) = self.intervention_hooks[key]
+                    source_input = sources[0] if len(sources) > 0 else None
+                    if source_input is not None:
+                        with self.model.trace(source_input, remote=False):
+                            if hook_type == "input":
+                                output = module_hook.input
+                            else:
+                                output = module_hook.output
+                            if isinstance(output, tuple):
+                                source_activations[key] = output[0].save()
+                            else:
+                                source_activations[key] = output.save()
+
+        # Generate with interventions
+        collected_activations = {}
+        with self.model.generate(base, remote=False, **kwargs):
+            for key_i, key in enumerate(self.sorted_keys):
+                intervention = self.interventions[key]
+                (module_hook, hook_type) = self.intervention_hooks[key]
+
+                if hook_type == "input":
+                    output = module_hook.input
+                else:
+                    output = module_hook.output
+
+                if isinstance(intervention, CollectIntervention):
+                    if isinstance(output, tuple):
+                        collected_activations[key] = output[0].save()
+                    else:
+                        collected_activations[key] = output.save()
+                elif isinstance(intervention, VanillaIntervention) and key in source_activations:
+                    src = source_activations[key]
+                    if isinstance(output, tuple):
+                        output[0][:] = src
+                    else:
+                        output[:] = src
+
+            generation_output = self.model.output.save()
+
+        # Convert activations
+        for key, act in collected_activations.items():
+            self.activations[key] = [act]
+
+        return None, generation_output
+
+    def _generate_remote(
+        self,
+        base,
+        sources: Optional[List] = None,
+        unit_locations: Optional[Dict] = None,
+        source_representations: Optional[Dict] = None,
+        intervene_on_prompt: bool = False,
+        subspaces: Optional[List] = None,
+        output_original_output: Optional[bool] = False,
+        **kwargs,
+    ):
+        """Remote generate using nnsight's generate context with NDIF."""
+        from .ndif_remote_helper import execute_remote_generate
+
+        activations_sources = source_representations
+        if unit_locations is None:
+            unit_locations = {}
+
+        # Normalize unit_locations
+        if "sources->base" not in unit_locations:
+            if "base" in unit_locations:
+                unit_locations = {"sources->base": (None, unit_locations["base"])}
+            else:
+                unit_locations = {"sources->base": (None, None)}
+
+        unit_locations = self._broadcast_unit_locations(
+            get_batch_size(base), unit_locations
+        )
+
+        # Build intervention specs
+        intervention_specs = []
+        for key_i, key in enumerate(self.sorted_keys):
+            intervention = self.interventions[key]
+            (module_hook, hook_type) = self.intervention_hooks[key]
+
+            spec = {
+                'key': key,
+                'module_hook': module_hook,
+                'hook_type': hook_type,
+                'is_collect': isinstance(intervention, CollectIntervention),
+                'is_vanilla': isinstance(intervention, VanillaIntervention),
+                'group_id': 0,  # Simplified for now
+            }
+            intervention_specs.append(spec)
+
+        # Call remote generate helper
+        result = execute_remote_generate(
+            model=self.model,
+            base=base,
+            sources=sources,
+            intervention_specs=intervention_specs,
+            activations_sources=activations_sources,
+            **kwargs
+        )
+
+        # Store collected activations
+        if result.get('activations'):
+            for key, activation in result['activations'].items():
+                if hasattr(activation, 'value'):
+                    self.activations[key] = [activation.value]
+                else:
+                    self.activations[key] = [activation]
+
+        return None, result['output']
 
 
 class IntervenableModel(BaseModel):
