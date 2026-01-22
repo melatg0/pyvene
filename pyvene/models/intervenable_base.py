@@ -14,6 +14,7 @@ from .configuration_intervenable_model import (
 )
 from .interventions import (
     TrainableIntervention,
+    DistributedRepresentationIntervention,
     SkipIntervention,
     CollectIntervention,
     BoundlessRotatedSpaceIntervention,
@@ -983,7 +984,7 @@ class IntervenableNdifModel(BaseModel):
                                 if subspaces is not None else None,
                                 None,
                             )
-                counterfactual_outputs = self.model.output.save()
+                counterfactual_outputs = self.model.lm_head.output.save()
 
         return counterfactual_outputs
 
@@ -1020,10 +1021,16 @@ class IntervenableNdifModel(BaseModel):
                     'hook_type': hook_type,
                     'is_collect': isinstance(intervention, CollectIntervention),
                     'is_vanilla': isinstance(intervention, VanillaIntervention),
+                    'is_trainable': isinstance(intervention, TrainableIntervention),
+                    'is_distributed': isinstance(intervention, DistributedRepresentationIntervention),
                     'is_source_constant': intervention.is_source_constant,
                     'source_loc': unit_locations_sources[key_idx] if unit_locations_sources else None,
                     'base_loc': unit_locations_base[key_idx] if unit_locations_base else None,
                     'group_id': group_id,
+                    # Include serialized weights for trainable interventions
+                    'intervention_weights': intervention.get_remote_weights()
+                        if hasattr(intervention, 'get_remote_weights') else None,
+                    'subspaces': subspaces[key_idx] if subspaces else None,
                 }
                 intervention_specs.append(spec)
 
@@ -1084,7 +1091,7 @@ class IntervenableNdifModel(BaseModel):
             and unit_locations is None and len(self.interventions) == 0:
             # ndif backend call
             with self.model.trace(base, remote=self.remote) as tracer:
-                base_outputs = self.model.output.save()
+                base_outputs = self.model.lm_head.output.save()
             return base_outputs, None
         # broadcast
         unit_locations = self._broadcast_unit_locations(get_batch_size(base), unit_locations)
@@ -1105,7 +1112,7 @@ class IntervenableNdifModel(BaseModel):
         if output_original_output:
             # returning un-intervened output with gradients with ndif backend call
             with self.model.trace(base, remote=self.remote) as tracer:
-                base_outputs = self.model.output.save()
+                base_outputs = self.model.lm_head.output.save()
 
         # intervene the model based on ndif APIs
         try:
@@ -1179,6 +1186,169 @@ class IntervenableNdifModel(BaseModel):
             )
 
         return base_outputs, counterfactual_outputs
+
+    def forward_with_gradients(
+        self,
+        base,
+        sources: Optional[List] = None,
+        unit_locations: Optional[Dict] = None,
+        source_representations: Optional[Dict] = None,
+        subspaces: Optional[List] = None,
+        labels: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        """
+        Forward pass with gradient support for training trainable interventions.
+
+        This method is designed for training scenarios where gradients need to flow
+        through the trainable intervention parameters (e.g., rotation matrices in
+        LowRankRotatedSpaceIntervention).
+
+        Strategy:
+        - For remote execution: Collect activations remotely, but apply the trainable
+          intervention locally to maintain gradient flow through intervention parameters.
+        - For local execution: Standard forward pass with full gradient flow.
+
+        Args:
+            base: Base input for the model
+            sources: Source inputs for intervention
+            unit_locations: Location specifications for interventions
+            source_representations: Pre-computed source representations
+            subspaces: Subspace indices for selective intervention
+            labels: Labels for computing loss (optional)
+            **kwargs: Additional keyword arguments passed to the model
+
+        Returns:
+            Model output with gradient flow through intervention parameters
+        """
+        activations_sources = source_representations
+        if sources is not None and not isinstance(sources, list):
+            sources = [sources]
+
+        self._cleanup_states()
+
+        # Broadcast locations and sources
+        unit_locations = self._broadcast_unit_locations(get_batch_size(base), unit_locations)
+        sources = [None] * len(self._intervention_group) if sources is None else sources
+        sources = self._broadcast_sources(sources)
+        activations_sources = self._broadcast_source_representations(activations_sources)
+        subspaces = self._broadcast_subspaces(get_batch_size(base), subspaces)
+
+        model_kwargs = {}
+        if labels is not None:
+            model_kwargs["labels"] = labels
+        model_kwargs.update(kwargs)
+
+        # Collect source activations using session for value propagation
+        source_activations = {}
+        with self.model.session(remote=self.remote):
+            if sources is not None:
+                for group_id, keys in self._intervention_group.items():
+                    if group_id >= len(sources) or sources[group_id] is None:
+                        continue
+                    with self.model.trace(sources[group_id]):
+                        for key in keys:
+                            (module_hook, hook_type) = self.intervention_hooks[key]
+                            if hook_type == "input":
+                                output = module_hook.input
+                            else:
+                                output = module_hook.output
+                            if isinstance(output, tuple):
+                                source_activations[key] = output[0].save()
+                            else:
+                                source_activations[key] = output.save()
+
+            # Forward with interventions, applying trainable interventions for gradient flow
+            with self.model.trace(base, **model_kwargs):
+                for key_idx, key in enumerate(self.sorted_keys):
+                    intervention = self.interventions[key]
+                    (module_hook, hook_type) = self.intervention_hooks[key]
+
+                    if hook_type == "input":
+                        base_output = module_hook.input
+                    else:
+                        base_output = module_hook.output
+
+                    if isinstance(base_output, tuple):
+                        base_act = base_output[0]
+                    else:
+                        base_act = base_output
+
+                    source_act = source_activations.get(key)
+
+                    if isinstance(intervention, TrainableIntervention) and source_act is not None:
+                        # Apply trainable intervention - gradients flow through intervention params
+                        # Get weights and apply rotation logic inline
+                        weights = intervention.get_remote_weights()
+                        rotation_matrix = weights.get('rotate_layer_weight')
+                        intervention_type = weights.get('intervention_type', 'rotated_space')
+
+                        if rotation_matrix is not None:
+                            # Rotation-based intervention
+                            import torch
+                            rotated_base = torch.matmul(base_act.to(rotation_matrix.dtype), rotation_matrix)
+                            rotated_source = torch.matmul(source_act.to(rotation_matrix.dtype), rotation_matrix)
+                            diff = rotated_source - rotated_base
+
+                            if intervention_type == 'boundless_rotated_space':
+                                intervention_boundaries = weights.get('intervention_boundaries')
+                                temperature = weights.get('temperature')
+                                intervention_population = weights.get('intervention_population')
+                                embed_dim = weights.get('embed_dim')
+                                batch_size = base_act.shape[0]
+
+                                intervention_boundaries = torch.clamp(intervention_boundaries, 1e-3, 1)
+                                positions = intervention_population.repeat(batch_size, 1).to(rotation_matrix.device)
+                                boundary_val = intervention_boundaries[0] * embed_dim
+                                boundary_mask = torch.sigmoid(temperature * (boundary_val - positions))
+                                boundary_mask = boundary_mask.to(rotated_base.dtype)
+
+                                rotated_output = (1.0 - boundary_mask) * rotated_base + boundary_mask * rotated_source
+                                intervened = torch.matmul(rotated_output, rotation_matrix.T).to(base_act.dtype)
+                            elif intervention_type == 'sigmoid_mask_rotated_space':
+                                masks = weights.get('masks')
+                                temperature = weights.get('temperature')
+                                batch_size = base_act.shape[0]
+
+                                boundary_mask = torch.sigmoid(masks / temperature)
+                                boundary_mask = torch.ones(batch_size, device=base_act.device).unsqueeze(dim=-1) * boundary_mask
+                                boundary_mask = boundary_mask.to(rotated_base.dtype)
+
+                                rotated_output = (1.0 - boundary_mask) * rotated_base + boundary_mask * rotated_source
+                                intervened = torch.matmul(rotated_output, rotation_matrix.T).to(base_act.dtype)
+                            else:
+                                # Standard rotation (low_rank_rotated_space, rotated_space)
+                                intervened = (base_act + torch.matmul(diff, rotation_matrix.T)).to(base_act.dtype)
+                        else:
+                            # SigmoidMaskIntervention (no rotation)
+                            mask = weights.get('mask')
+                            temperature = weights.get('temperature')
+                            if mask is not None:
+                                import torch
+                                mask_sigmoid = torch.sigmoid(mask / temperature)
+                                intervened = (1.0 - mask_sigmoid) * base_act + mask_sigmoid * source_act
+                            else:
+                                intervened = source_act
+
+                        if isinstance(base_output, tuple):
+                            base_output[0][:] = intervened
+                        else:
+                            base_output[:] = intervened
+
+                    elif isinstance(intervention, CollectIntervention):
+                        # Just collect, don't modify
+                        self.activations[key] = [base_act.save()]
+
+                    elif source_act is not None:
+                        # Non-trainable intervention (VanillaIntervention, etc.)
+                        if isinstance(base_output, tuple):
+                            base_output[0][:] = source_act
+                        else:
+                            base_output[:] = source_act
+
+                output = self.model.lm_head.output.save()
+
+        return output
 
     def generate(
         self,
