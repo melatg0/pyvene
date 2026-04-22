@@ -112,6 +112,8 @@ def getattr_for_torch_module(model, parameter_name):
 def get_dimension_by_component(model_type, model_config, component) -> int:
     """Based on the representation, get the aligning dimension size."""
 
+    if model_type not in type_to_dimension_mapping:
+        return None
     if component not in type_to_dimension_mapping[model_type]:
         return None
 

@@ -516,7 +516,7 @@ def execute_remote_generate(
                 else:
                     output[:] = intervened
 
-            gen_output = model.output.save()
+            gen_output = model.generator.output.save()
 
     return {'output': gen_output, 'activations': collected_activations}
 

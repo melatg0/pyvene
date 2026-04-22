@@ -52,7 +52,8 @@ class BaseModel(nn.Module):
         super().__init__()
         if isinstance(config, dict) or isinstance(config, list):
             config = IntervenableConfig(
-                representations = config
+                representations = config,
+                mode = kwargs.get("mode", "parallel"),
             )
         self.config = config
         
@@ -138,6 +139,8 @@ class BaseModel(nn.Module):
                 )
                 if component_dim is not None:
                     component_dim *= int(representation.max_number_of_units)
+                elif hasattr(model, 'config') and hasattr(model.config, 'hidden_size'):
+                    component_dim = model.config.hidden_size * int(representation.max_number_of_units)
                 all_metadata["embed_dim"] = component_dim
                 all_metadata["use_fast"] = self.use_fast
                 intervention = intervention_function(
@@ -483,7 +486,14 @@ class BaseModel(nn.Module):
                 original_output = output.clone()
             # for non-sequence models, there is no concept of
             # unit location anyway.
-            if unit_locations is None:
+            # Also treat lists that contain only None values as "no filtering".
+            def _is_none_locations(loc):
+                if loc is None:
+                    return True
+                if isinstance(loc, (list, tuple)):
+                    return all(_is_none_locations(x) for x in loc)
+                return False
+            if _is_none_locations(unit_locations):
                 return original_output
             # gather subcomponent
             original_output = output_to_subcomponent(
@@ -526,10 +536,16 @@ class BaseModel(nn.Module):
             original_output = output
         # for non-sequence-based models, we simply replace
         # all the activations.
-        if unit_locations is None:
+        def _is_none_locations(loc):
+            if loc is None:
+                return True
+            if isinstance(loc, (list, tuple)):
+                return all(_is_none_locations(x) for x in loc)
+            return False
+        if _is_none_locations(unit_locations):
             original_output[:] = intervened_representation[:]
             return original_output
-        
+
         component = self.representations[
             representations_key
         ].component
@@ -740,7 +756,9 @@ class IntervenableNdifModel(BaseModel):
         saving_config.intervention_constant_sources = []
 
         serialized_representations = []
-        for reprs in saving_config.representations:
+        intervention_list = list(self.interventions.values())
+        for i, reprs in enumerate(saving_config.representations):
+            intervention_obj = intervention_list[i] if i < len(intervention_list) else None
             serialized_reprs = {}
             for k, v in reprs._asdict().items():
                 if k == "hidden_source_representation":
@@ -751,6 +769,13 @@ class IntervenableNdifModel(BaseModel):
                     serialized_reprs[k] = None
                 elif k in ("intervention_type", "intervention"):
                     serialized_reprs[k] = None
+                elif k == "low_rank_dimension" and v is None and intervention_obj is not None:
+                    # Extract low_rank_dimension from trainable intervention's rotate layer
+                    if hasattr(intervention_obj, 'rotate_layer') and \
+                            hasattr(intervention_obj.rotate_layer, 'weight'):
+                        serialized_reprs[k] = intervention_obj.rotate_layer.weight.shape[1]
+                    else:
+                        serialized_reprs[k] = v
                 else:
                     serialized_reprs[k] = v
             serialized_representations.append(RepresentationConfig(**serialized_reprs))
@@ -1207,8 +1232,37 @@ class IntervenableNdifModel(BaseModel):
         **kwargs,
     ):
         """Serial intervention: each group's source is run through the model with prior groups patched in."""
-        unit_locations_sources = unit_locations.get("sources->base", (None, None))[0]
-        unit_locations_base = unit_locations.get("sources->base", (None, None))[1]
+        # Serial mode uses keys like "source_0->source_1" and "source_1->base".
+        # Collect all source-to-base and source-to-source location mappings.
+        # Fall back to None (no filtering) when not specified.
+        sorted_group_ids_list = sorted(self._intervention_group.keys())
+        num_groups = len(sorted_group_ids_list)
+        # Build per-group source unit locations from serial keys
+        _per_group_src_locs = {}  # group_id -> unit_locations for source trace
+        _per_group_base_locs = {}  # last group -> unit_locations for base trace
+        for i, gid in enumerate(sorted_group_ids_list):
+            if i < num_groups - 1:
+                k = f"source_{i}->source_{i+1}"
+            else:
+                k = f"source_{i}->base"
+            if k in unit_locations:
+                v = unit_locations[k]
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    _per_group_src_locs[gid] = v[0]
+                    _per_group_base_locs[gid] = v[1]
+                else:
+                    _per_group_src_locs[gid] = v
+                    _per_group_base_locs[gid] = v
+            else:
+                _per_group_src_locs[gid] = None
+                _per_group_base_locs[gid] = None
+        # Flatten to lists matching sorted_keys order for compatibility
+        unit_locations_sources = [_per_group_src_locs.get(gid, None)
+                                   for gid in sorted_group_ids_list
+                                   for _ in self._intervention_group[gid]]
+        unit_locations_base = [_per_group_base_locs.get(gid, None)
+                                for gid in sorted_group_ids_list
+                                for _ in self._intervention_group[gid]]
 
         if self.remote:
             from .ndif_remote_helper import execute_remote_serial_intervention
@@ -1736,7 +1790,7 @@ class IntervenableNdifModel(BaseModel):
                         else:
                             out_proxy[:] = new_act
 
-                generation_output = self.model.output.save()
+                generation_output = self.model.generator.output.save()
 
         for key, act in collected_activations.items():
             self.activations[key] = [act]
