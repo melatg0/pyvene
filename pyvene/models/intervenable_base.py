@@ -726,6 +726,13 @@ class IntervenableNdifModel(BaseModel):
         logging.warning(
             f"We currently have very limited intervention support for ndif backend."
         )
+        if self.remote:
+            try:
+                from nnsight import ndif as _ndif
+                from pyvene.models import ndif_remote_helper as _ndif_helper
+                _ndif.register(_ndif_helper)
+            except Exception:
+                pass
 
     def _get_output_module(self):
         """Return the nnsight module whose .output gives the final logits."""
@@ -822,7 +829,7 @@ class IntervenableNdifModel(BaseModel):
             )
 
     @staticmethod
-    def load(load_directory, model, local_directory=None, from_huggingface_hub=False):
+    def load(load_directory, model, local_directory=None, from_huggingface_hub=False, remote=False):
         """Load interventions from disk or HuggingFace Hub."""
         if not os.path.exists(load_directory) or from_huggingface_hub:
             from huggingface_hub import snapshot_download
@@ -842,7 +849,7 @@ class IntervenableNdifModel(BaseModel):
             casted_representations.append(RepresentationConfig(*representation_opts))
         saving_config.representations = casted_representations
 
-        intervenable = IntervenableNdifModel(saving_config, model)
+        intervenable = IntervenableNdifModel(saving_config, model, remote=remote)
 
         for i, (k, v) in enumerate(intervenable.interventions.items()):
             intervention = v
