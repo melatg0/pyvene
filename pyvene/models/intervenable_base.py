@@ -711,6 +711,17 @@ class IntervenableNdifModel(BaseModel):
             f"We currently have very limited intervention support for ndif backend."
         )
 
+    def _get_output_module(self):
+        """Return the nnsight module whose .output gives the final logits."""
+        m = self.model
+        if hasattr(m, 'lm_head'):   return m.lm_head    # GPT-2, LLaMA, Mistral, Gemma, Qwen
+        if hasattr(m, 'embed_out'): return m.embed_out  # GPT-NeoX
+        if hasattr(m, 'cls'):       return m.cls         # BERT-style
+        raise ValueError(
+            f"Cannot determine output module for {type(m)}. "
+            "Add the model's head attribute to _get_output_module()."
+        )
+
     def save(
         self, save_directory, save_to_hf_hub=False, hf_repo_name="my-awesome-model"
     ):
@@ -984,7 +995,7 @@ class IntervenableNdifModel(BaseModel):
                                 if subspaces is not None else None,
                                 None,
                             )
-                counterfactual_outputs = self.model.lm_head.output.save()
+                counterfactual_outputs = self._get_output_module().output.save()
 
         return counterfactual_outputs
 
@@ -1024,6 +1035,11 @@ class IntervenableNdifModel(BaseModel):
                     'is_trainable': isinstance(intervention, TrainableIntervention),
                     'is_distributed': isinstance(intervention, DistributedRepresentationIntervention),
                     'is_source_constant': intervention.is_source_constant,
+                    'is_zero': isinstance(intervention, ZeroIntervention),
+                    'is_addition': isinstance(intervention, AdditionIntervention),
+                    'is_subtraction': isinstance(intervention, SubtractionIntervention),
+                    'is_noise': isinstance(intervention, NoiseIntervention),
+                    'is_lambda': isinstance(intervention, LambdaIntervention),
                     'source_loc': unit_locations_sources[key_idx] if unit_locations_sources else None,
                     'base_loc': unit_locations_base[key_idx] if unit_locations_base else None,
                     'group_id': group_id,
@@ -1031,6 +1047,13 @@ class IntervenableNdifModel(BaseModel):
                     'intervention_weights': intervention.get_remote_weights()
                         if hasattr(intervention, 'get_remote_weights') else None,
                     'subspaces': subspaces[key_idx] if subspaces else None,
+                    # Serializable fields for non-trainable non-vanilla types
+                    'source_representation': intervention.source_representation.detach().clone()
+                        if getattr(intervention, 'source_representation', None) is not None else None,
+                    'interchange_dim': int(intervention.interchange_dim)
+                        if getattr(intervention, 'interchange_dim', None) is not None else None,
+                    'noise_level': float(getattr(intervention, 'noise_level', 0.0)),
+                    'lambda_fn': intervention.func if isinstance(intervention, LambdaIntervention) else None,
                 }
                 intervention_specs.append(spec)
 
@@ -1042,6 +1065,7 @@ class IntervenableNdifModel(BaseModel):
             intervention_specs=intervention_specs,
             intervention_group=dict(self._intervention_group),
             activations_sources=activations_sources,
+            output_module=self._get_output_module(),
             **kwargs
         )
 
@@ -1091,7 +1115,7 @@ class IntervenableNdifModel(BaseModel):
             and unit_locations is None and len(self.interventions) == 0:
             # ndif backend call
             with self.model.trace(base, remote=self.remote) as tracer:
-                base_outputs = self.model.lm_head.output.save()
+                base_outputs = self._get_output_module().output.save()
             return base_outputs, None
         # broadcast
         unit_locations = self._broadcast_unit_locations(get_batch_size(base), unit_locations)
@@ -1112,7 +1136,7 @@ class IntervenableNdifModel(BaseModel):
         if output_original_output:
             # returning un-intervened output with gradients with ndif backend call
             with self.model.trace(base, remote=self.remote) as tracer:
-                base_outputs = self.model.lm_head.output.save()
+                base_outputs = self._get_output_module().output.save()
 
         # intervene the model based on ndif APIs
         try:
@@ -1346,7 +1370,7 @@ class IntervenableNdifModel(BaseModel):
                         else:
                             base_output[:] = source_act
 
-                output = self.model.lm_head.output.save()
+                output = self._get_output_module().output.save()
 
         return output
 
