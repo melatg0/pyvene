@@ -725,14 +725,130 @@ class IntervenableNdifModel(BaseModel):
     def save(
         self, save_directory, save_to_hf_hub=False, hf_repo_name="my-awesome-model"
     ):
-        pass
+        """Save interventions and config to disk (or HuggingFace Hub)."""
+        if save_to_hf_hub:
+            from huggingface_hub import HfApi
+            api = HfApi()
+
+        create_directory(save_directory)
+
+        saving_config = copy.deepcopy(self.config)
+        saving_config.sorted_keys = self.sorted_keys
+        saving_config.model_type = str(saving_config.model_type)
+        saving_config.intervention_types = []
+        saving_config.intervention_dimensions = []
+        saving_config.intervention_constant_sources = []
+
+        serialized_representations = []
+        for reprs in saving_config.representations:
+            serialized_reprs = {}
+            for k, v in reprs._asdict().items():
+                if k == "hidden_source_representation":
+                    continue
+                if k == "source_representation":
+                    if v is not None:
+                        serialized_reprs["hidden_source_representation"] = True
+                    serialized_reprs[k] = None
+                elif k in ("intervention_type", "intervention"):
+                    serialized_reprs[k] = None
+                else:
+                    serialized_reprs[k] = v
+            serialized_representations.append(RepresentationConfig(**serialized_reprs))
+        saving_config.representations = serialized_representations
+
+        for k, v in self.interventions.items():
+            intervention = v
+            saving_config.intervention_types.append(str(type(intervention)))
+            binary_filename = f"intkey_{k}.bin"
+            if isinstance(intervention, TrainableIntervention) or \
+                    intervention.source_representation is not None:
+                torch.save(
+                    intervention.state_dict(),
+                    os.path.join(save_directory, binary_filename),
+                )
+                if save_to_hf_hub:
+                    try:
+                        api.create_repo(hf_repo_name)
+                    except Exception:
+                        pass
+                    api.upload_file(
+                        path_or_fileobj=os.path.join(save_directory, binary_filename),
+                        path_in_repo=binary_filename,
+                        repo_id=hf_repo_name,
+                        repo_type="model",
+                    )
+            if intervention.interchange_dim is None:
+                saving_config.intervention_dimensions.append(None)
+            else:
+                saving_config.intervention_dimensions.append(intervention.interchange_dim.tolist())
+            saving_config.intervention_constant_sources.append(intervention.is_source_constant)
+
+        saving_config.save_pretrained(save_directory)
+        if save_to_hf_hub:
+            try:
+                api.create_repo(hf_repo_name)
+            except Exception:
+                pass
+            api.upload_file(
+                path_or_fileobj=os.path.join(save_directory, "config.json"),
+                path_in_repo="config.json",
+                repo_id=hf_repo_name,
+                repo_type="model",
+            )
 
     @staticmethod
     def load(load_directory, model, local_directory=None, from_huggingface_hub=False):
-        """
-        Load interventions from disk or hub
-        """
-        pass
+        """Load interventions from disk or HuggingFace Hub."""
+        if not os.path.exists(load_directory) or from_huggingface_hub:
+            from huggingface_hub import snapshot_download
+            load_directory = snapshot_download(
+                repo_id=load_directory,
+                local_dir=local_directory,
+            )
+
+        saving_config = IntervenableConfig.from_pretrained(load_directory)
+        casted_intervention_types = []
+        for type_str in saving_config.intervention_types:
+            casted_intervention_types.append(get_type_from_string(type_str))
+        saving_config.intervention_types = casted_intervention_types
+
+        casted_representations = []
+        for representation_opts in saving_config.representations:
+            casted_representations.append(RepresentationConfig(*representation_opts))
+        saving_config.representations = casted_representations
+
+        intervenable = IntervenableNdifModel(saving_config, model)
+
+        for i, (k, v) in enumerate(intervenable.interventions.items()):
+            intervention = v
+            binary_filename = f"intkey_{k}.bin"
+            intervention.is_source_constant = saving_config.intervention_constant_sources[i]
+            dim = saving_config.intervention_dimensions[i]
+            if dim is None:
+                component_name = saving_config.representations[i].component
+                if component_name.startswith("head_"):
+                    dim = model.config.hidden_size // model.config.num_attention_heads
+                else:
+                    dim = model.config.hidden_size
+            intervention.set_interchange_dim(dim)
+            bin_path = os.path.join(load_directory, binary_filename)
+            if saving_config.intervention_constant_sources[i] and \
+                    not isinstance(intervention, ZeroIntervention) and \
+                    not isinstance(intervention, SourcelessIntervention):
+                if os.path.exists(bin_path):
+                    saved_state_dict = torch.load(bin_path)
+                    try:
+                        intervention.register_buffer(
+                            'source_representation', saved_state_dict['source_representation']
+                        )
+                    except Exception:
+                        intervention.source_representation = saved_state_dict['source_representation']
+            elif isinstance(intervention, TrainableIntervention):
+                if os.path.exists(bin_path):
+                    saved_state_dict = torch.load(bin_path)
+                    intervention.load_state_dict(saved_state_dict)
+
+        return intervenable
 
     def _cleanup_states(self, skip_activation_gc=False):
         """
@@ -1090,7 +1206,131 @@ class IntervenableNdifModel(BaseModel):
         subspaces: Optional[List] = None,
         **kwargs,
     ):
-        raise NotImplementedError("Please Implement serial intervention support for ndif")
+        """Serial intervention: each group's source is run through the model with prior groups patched in."""
+        unit_locations_sources = unit_locations.get("sources->base", (None, None))[0]
+        unit_locations_base = unit_locations.get("sources->base", (None, None))[1]
+
+        if self.remote:
+            from .ndif_remote_helper import execute_remote_serial_intervention
+
+            intervention_specs = []
+            for group_id, keys in self._intervention_group.items():
+                for key in keys:
+                    intervention = self.interventions[key]
+                    (module_hook, hook_type) = self.intervention_hooks[key]
+                    key_idx = self.sorted_keys.index(key)
+                    spec = {
+                        'key': key,
+                        'module_hook': module_hook,
+                        'hook_type': hook_type,
+                        'group_id': group_id,
+                        'is_collect': isinstance(intervention, CollectIntervention),
+                        'is_vanilla': isinstance(intervention, VanillaIntervention),
+                        'is_trainable': isinstance(intervention, TrainableIntervention),
+                        'is_source_constant': intervention.is_source_constant,
+                        'is_zero': isinstance(intervention, ZeroIntervention),
+                        'is_addition': isinstance(intervention, AdditionIntervention),
+                        'is_subtraction': isinstance(intervention, SubtractionIntervention),
+                        'is_noise': isinstance(intervention, NoiseIntervention),
+                        'is_lambda': isinstance(intervention, LambdaIntervention),
+                        'intervention_weights': intervention.get_remote_weights()
+                            if hasattr(intervention, 'get_remote_weights') else None,
+                        'subspaces': subspaces[key_idx] if subspaces else None,
+                        'source_representation': intervention.source_representation.detach().clone()
+                            if getattr(intervention, 'source_representation', None) is not None else None,
+                        'interchange_dim': int(intervention.interchange_dim)
+                            if getattr(intervention, 'interchange_dim', None) is not None else None,
+                        'noise_level': float(getattr(intervention, 'noise_level', 0.0)),
+                        'lambda_fn': intervention.func if isinstance(intervention, LambdaIntervention) else None,
+                    }
+                    intervention_specs.append(spec)
+
+            result = execute_remote_serial_intervention(
+                model=self.model,
+                base=base,
+                sources=sources,
+                intervention_specs=intervention_specs,
+                intervention_group=dict(self._intervention_group),
+                output_module=self._get_output_module(),
+                **kwargs
+            )
+            return result['output']
+
+        else:
+            # Local serial path
+            sorted_group_ids = sorted(self._intervention_group.keys())
+            source_activations = {} if activations_sources is None else dict(activations_sources)
+
+            with self.model.session(remote=False):
+                if activations_sources is None and sources is not None:
+                    for group_id in sorted_group_ids:
+                        keys = self._intervention_group[group_id]
+                        src_input = sources[group_id] if group_id < len(sources) else None
+                        if src_input is None:
+                            continue
+                        with self.model.trace(src_input):
+                            # Apply prior group interventions to this source trace
+                            for prior_id in sorted_group_ids:
+                                if prior_id >= group_id:
+                                    break
+                                for prior_key in self._intervention_group[prior_id]:
+                                    if prior_key not in source_activations:
+                                        continue
+                                    prior_intervention = self.interventions[prior_key]
+                                    (phook, ptype) = self.intervention_hooks[prior_key]
+                                    pout = phook.input if ptype == CONST_INPUT_HOOK else phook.output
+                                    pact = pout[0] if isinstance(pout, tuple) else pout
+                                    sp = subspaces[self.sorted_keys.index(prior_key)] if subspaces else None
+                                    new = do_intervention(pact, source_activations[prior_key], prior_intervention, sp)
+                                    if isinstance(pout, tuple):
+                                        pout[0][:] = new
+                                    else:
+                                        pout[:] = new
+                            # Collect current group's activations
+                            for key in keys:
+                                intervention = self.interventions[key]
+                                if intervention.is_source_constant:
+                                    continue
+                                (module_hook, hook_type) = self.intervention_hooks[key]
+                                out_proxy = module_hook.input if hook_type == CONST_INPUT_HOOK else module_hook.output
+                                act = out_proxy[0] if isinstance(out_proxy, tuple) else out_proxy
+                                source_activations[key] = act.save()
+
+                # Final base pass with all collected activations
+                with self.model.trace(base, **kwargs):
+                    for group_id, keys in self._intervention_group.items():
+                        for key in keys:
+                            if key not in source_activations and \
+                                    not self.interventions[key].is_source_constant and \
+                                    not isinstance(self.interventions[key], (ZeroIntervention, NoiseIntervention, LambdaIntervention)):
+                                continue
+                            intervention = self.interventions[key]
+                            (module_hook, hook_type) = self.intervention_hooks[key]
+                            out_proxy = module_hook.input if hook_type == CONST_INPUT_HOOK else module_hook.output
+                            act = out_proxy[0] if isinstance(out_proxy, tuple) else out_proxy
+                            sp = subspaces[self.sorted_keys.index(key)] if subspaces else None
+
+                            if isinstance(intervention, ZeroIntervention):
+                                new_act = torch.zeros_like(act)
+                            elif isinstance(intervention, NoiseIntervention):
+                                nl = float(getattr(intervention, 'noise_level', 0.0))
+                                new_act = act + torch.randn_like(act) * nl
+                            elif isinstance(intervention, LambdaIntervention):
+                                new_act = intervention.func(act, source_activations.get(key))
+                            else:
+                                src = source_activations.get(key)
+                                if src is None:
+                                    continue
+                                new_act = do_intervention(act, src, intervention, sp)
+
+                            if isinstance(out_proxy, tuple):
+                                out_proxy[0][:] = new_act
+                            else:
+                                out_proxy[:] = new_act
+
+                    counterfactual_outputs = self._get_output_module().output.save()
+
+            return counterfactual_outputs
     
     def forward(
         self,
@@ -1412,69 +1652,92 @@ class IntervenableNdifModel(BaseModel):
         output_original_output: Optional[bool] = False,
         **kwargs,
     ):
-        """Local generate using nnsight's generate context."""
-        # Build intervention specs (same as forward)
+        """Local generate using nnsight's generate context with full intervention taxonomy."""
         activations_sources = source_representations
         if unit_locations is None:
             unit_locations = {}
-
-        # Normalize unit_locations
         if "sources->base" not in unit_locations:
             if "base" in unit_locations:
                 unit_locations = {"sources->base": (None, unit_locations["base"])}
             else:
                 unit_locations = {"sources->base": (None, None)}
+        unit_locations = self._broadcast_unit_locations(get_batch_size(base), unit_locations)
 
-        unit_locations = self._broadcast_unit_locations(
-            get_batch_size(base), unit_locations
-        )
-
-        # Collect source activations first (if needed)
-        source_activations = {}
-        if activations_sources is None and sources is not None:
-            for key_i, key in enumerate(self.sorted_keys):
-                intervention = self.interventions[key]
-                if isinstance(intervention, VanillaIntervention):
-                    (module_hook, hook_type) = self.intervention_hooks[key]
-                    source_input = sources[0] if len(sources) > 0 else None
-                    if source_input is not None:
-                        with self.model.trace(source_input, remote=False):
-                            if hook_type == "input":
-                                output = module_hook.input
-                            else:
-                                output = module_hook.output
-                            if isinstance(output, tuple):
-                                source_activations[key] = output[0].save()
-                            else:
-                                source_activations[key] = output.save()
-
-        # Generate with interventions
+        source_activations = {} if activations_sources is None else dict(activations_sources)
         collected_activations = {}
-        with self.model.generate(base, remote=False, **kwargs):
-            for key_i, key in enumerate(self.sorted_keys):
-                intervention = self.interventions[key]
-                (module_hook, hook_type) = self.intervention_hooks[key]
 
-                if hook_type == "input":
-                    output = module_hook.input
-                else:
-                    output = module_hook.output
+        with self.model.session(remote=False):
+            # Source collection pass (one trace per group)
+            if activations_sources is None and sources is not None:
+                for group_id, keys in self._intervention_group.items():
+                    if group_id >= len(sources) or sources[group_id] is None:
+                        continue
+                    with self.model.trace(sources[group_id]):
+                        for key in keys:
+                            intervention = self.interventions[key]
+                            if intervention.is_source_constant:
+                                continue
+                            (module_hook, hook_type) = self.intervention_hooks[key]
+                            out_proxy = module_hook.input if hook_type == CONST_INPUT_HOOK else module_hook.output
+                            act = out_proxy[0] if isinstance(out_proxy, tuple) else out_proxy
+                            source_activations[key] = act.save()
 
-                if isinstance(intervention, CollectIntervention):
-                    if isinstance(output, tuple):
-                        collected_activations[key] = output[0].save()
-                    else:
-                        collected_activations[key] = output.save()
-                elif isinstance(intervention, VanillaIntervention) and key in source_activations:
-                    src = source_activations[key]
-                    if isinstance(output, tuple):
-                        output[0][:] = src
-                    else:
-                        output[:] = src
+            # Generation pass with all interventions applied
+            with self.model.generate(base, **kwargs):
+                for group_id, keys in self._intervention_group.items():
+                    for key in keys:
+                        intervention = self.interventions[key]
+                        (module_hook, hook_type) = self.intervention_hooks[key]
+                        out_proxy = module_hook.input if hook_type == CONST_INPUT_HOOK else module_hook.output
+                        act = out_proxy[0] if isinstance(out_proxy, tuple) else out_proxy
 
-            generation_output = self.model.output.save()
+                        if isinstance(intervention, CollectIntervention):
+                            collected_activations[key] = act.save()
+                            continue
 
-        # Convert activations
+                        if isinstance(intervention, ZeroIntervention):
+                            new_act = torch.zeros_like(act)
+                        elif isinstance(intervention, NoiseIntervention):
+                            noise_level = float(getattr(intervention, 'noise_level', 0.0))
+                            interchange_d = int(intervention.interchange_dim) \
+                                if getattr(intervention, 'interchange_dim', None) is not None else None
+                            if interchange_d is not None:
+                                noisy = act.clone()
+                                noisy[..., :interchange_d] = (
+                                    act[..., :interchange_d]
+                                    + torch.randn_like(act[..., :interchange_d]) * noise_level
+                                )
+                                new_act = noisy
+                            else:
+                                new_act = act + torch.randn_like(act) * noise_level
+                        elif isinstance(intervention, LambdaIntervention):
+                            src = source_activations.get(key)
+                            new_act = intervention.func(act, src)
+                        else:
+                            src = (
+                                intervention.source_representation.detach()
+                                if getattr(intervention, 'source_representation', None) is not None
+                                else source_activations.get(key)
+                            )
+                            if src is None:
+                                continue
+                            if isinstance(intervention, AdditionIntervention):
+                                new_act = act + src
+                            elif isinstance(intervention, SubtractionIntervention):
+                                new_act = act - src
+                            elif isinstance(intervention, (VanillaIntervention, TrainableIntervention)):
+                                sp = subspaces[self.sorted_keys.index(key)] if subspaces is not None else None
+                                new_act = do_intervention(act, src, intervention, sp)
+                            else:
+                                new_act = src
+
+                        if isinstance(out_proxy, tuple):
+                            out_proxy[0][:] = new_act
+                        else:
+                            out_proxy[:] = new_act
+
+                generation_output = self.model.output.save()
+
         for key, act in collected_activations.items():
             self.activations[key] = [act]
 
@@ -1509,21 +1772,40 @@ class IntervenableNdifModel(BaseModel):
             get_batch_size(base), unit_locations
         )
 
-        # Build intervention specs
+        # Build full intervention specs (mirrors _sync_forward_remote)
         intervention_specs = []
-        for key_i, key in enumerate(self.sorted_keys):
-            intervention = self.interventions[key]
-            (module_hook, hook_type) = self.intervention_hooks[key]
+        for group_id, keys in self._intervention_group.items():
+            for key in keys:
+                intervention = self.interventions[key]
+                (module_hook, hook_type) = self.intervention_hooks[key]
+                key_idx = self.sorted_keys.index(key)
 
-            spec = {
-                'key': key,
-                'module_hook': module_hook,
-                'hook_type': hook_type,
-                'is_collect': isinstance(intervention, CollectIntervention),
-                'is_vanilla': isinstance(intervention, VanillaIntervention),
-                'group_id': 0,  # Simplified for now
-            }
-            intervention_specs.append(spec)
+                spec = {
+                    'key': key,
+                    'module_hook': module_hook,
+                    'hook_type': hook_type,
+                    'group_id': group_id,
+                    'is_collect': isinstance(intervention, CollectIntervention),
+                    'is_vanilla': isinstance(intervention, VanillaIntervention),
+                    'is_trainable': isinstance(intervention, TrainableIntervention),
+                    'is_distributed': isinstance(intervention, DistributedRepresentationIntervention),
+                    'is_source_constant': intervention.is_source_constant,
+                    'is_zero': isinstance(intervention, ZeroIntervention),
+                    'is_addition': isinstance(intervention, AdditionIntervention),
+                    'is_subtraction': isinstance(intervention, SubtractionIntervention),
+                    'is_noise': isinstance(intervention, NoiseIntervention),
+                    'is_lambda': isinstance(intervention, LambdaIntervention),
+                    'intervention_weights': intervention.get_remote_weights()
+                        if hasattr(intervention, 'get_remote_weights') else None,
+                    'subspaces': subspaces[key_idx] if subspaces else None,
+                    'source_representation': intervention.source_representation.detach().clone()
+                        if getattr(intervention, 'source_representation', None) is not None else None,
+                    'interchange_dim': int(intervention.interchange_dim)
+                        if getattr(intervention, 'interchange_dim', None) is not None else None,
+                    'noise_level': float(getattr(intervention, 'noise_level', 0.0)),
+                    'lambda_fn': intervention.func if isinstance(intervention, LambdaIntervention) else None,
+                }
+                intervention_specs.append(spec)
 
         # Call remote generate helper
         result = execute_remote_generate(
@@ -1532,6 +1814,7 @@ class IntervenableNdifModel(BaseModel):
             sources=sources,
             intervention_specs=intervention_specs,
             activations_sources=activations_sources,
+            output_module=self._get_output_module(),
             **kwargs
         )
 

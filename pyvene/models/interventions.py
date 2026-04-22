@@ -604,6 +604,17 @@ class PCARotatedSpaceIntervention(BasisAgnosticIntervention, DistributedRepresen
         output = (output * self.pca_std) + self.pca_mean
         return output
 
+    def get_remote_weights(self):
+        """Extract weights for remote NDIF execution."""
+        return {
+            'intervention_type': 'pca_rotated_space',
+            'pca_components': self.pca_components.detach().clone(),
+            'pca_mean': self.pca_mean.detach().clone(),
+            'pca_std': self.pca_std.detach().clone(),
+            'interchange_dim': int(self.interchange_dim) if self.interchange_dim is not None else None,
+            'subspace_partition': self.subspace_partition,
+        }
+
     def __str__(self):
         return f"PCARotatedSpaceIntervention()"
 
@@ -649,6 +660,19 @@ class AutoencoderIntervention(TrainableIntervention):
         inv_output = self.autoencoder.decode(base_latent)
         return inv_output.to(base_dtype)
 
+    def get_remote_weights(self):
+        """Extract weights for remote NDIF execution."""
+        enc_sd = self.autoencoder.encoder[0].state_dict()
+        dec_sd = self.autoencoder.decoder[0].state_dict()
+        return {
+            'intervention_type': 'autoencoder',
+            'encoder_weight': enc_sd['weight'].detach().clone(),
+            'encoder_bias': enc_sd['bias'].detach().clone(),
+            'decoder_weight': dec_sd['weight'].detach().clone(),
+            'decoder_bias': dec_sd['bias'].detach().clone(),
+            'interchange_dim': int(self.interchange_dim) if self.interchange_dim is not None else None,
+        }
+
     def __str__(self):
         return f"AutoencoderIntervention()"
 
@@ -691,6 +715,18 @@ class JumpReLUAutoencoderIntervention(TrainableIntervention):
         # decode intervened latent.
         recon = self.decode(intervened_latent)
         return recon
+
+    def get_remote_weights(self):
+        """Extract weights for remote NDIF execution."""
+        return {
+            'intervention_type': 'jumprelu_autoencoder',
+            'W_enc': self.W_enc.detach().clone(),
+            'W_dec': self.W_dec.detach().clone(),
+            'threshold': self.threshold.detach().clone(),
+            'b_enc': self.b_enc.detach().clone(),
+            'b_dec': self.b_dec.detach().clone(),
+            'interchange_dim': int(self.interchange_dim) if self.interchange_dim is not None else None,
+        }
 
     def __str__(self):
         return f"JumpReLUAutoencoderIntervention()"
